@@ -14,10 +14,6 @@
 #include <condition_variable>
 #include <memory>
 #include "JoyConDecoder.h"
-#include <Windows.h>
-
-#include <ViGEm/Client.h>
-#include <ViGEm/Common.h>
 
 using namespace winrt;
 using namespace Windows::Devices::Bluetooth;
@@ -30,39 +26,6 @@ constexpr uint16_t JOYCON_MANUFACTURER_ID = 1363; // Nintendo
 const std::vector<uint8_t> JOYCON_MANUFACTURER_PREFIX = { 0x01, 0x00, 0x03, 0x7E };
 const wchar_t* INPUT_REPORT_UUID = L"ab7de9be-89fe-49ad-828f-118f09df7fd2";
 const wchar_t* WRITE_COMMAND_UUID = L"649d4ac9-8eb7-4e6c-af44-1ea54fe5f005";
-
-PVIGEM_CLIENT vigem_client = nullptr;
-
-void InitializeViGEm()
-{
-    if (vigem_client != nullptr)
-        return;
-
-    vigem_client = vigem_alloc();
-    if (vigem_client == nullptr)
-    {
-        std::wcerr << L"Failed to allocate ViGEm client.\n";
-        exit(1);
-    }
-
-    auto ret = vigem_connect(vigem_client);
-    if (!VIGEM_SUCCESS(ret))
-    {
-        std::wcerr << L"Failed to connect to ViGEm bus: 0x" << std::hex << ret << L"\n";
-        exit(1);
-    }
-
-    std::wcout << L"ViGEm client initialized and connected.\n";
-}
-
-void PrintRawNotification(const std::vector<uint8_t>& buffer)
-{
-    std::cout << "[Raw Notification] ";
-    for (auto b : buffer) {
-        printf("%02X ", b);
-    }
-    std::cout << std::endl;
-}
 
 void SendCustomCommands(GattCharacteristic const& characteristic)
 {
@@ -98,17 +61,15 @@ struct ConnectedJoyCon {
     GattCharacteristic writeChar = nullptr;
 };
 
-ConnectedJoyCon WaitForJoyCon(const std::wstring& prompt)
+ConnectedJoyCon WaitForJoyCon()
 {
-    std::wcout << prompt << L"\n";
+    std::wcout << L"Looking for Right Joy-Con...\n";
 
     ConnectedJoyCon cj{};
-
     BluetoothLEDevice device = nullptr;
     bool connected = false;
 
     BluetoothLEAdvertisementWatcher watcher;
-
     std::mutex mtx;
     std::condition_variable cv;
 
@@ -142,7 +103,8 @@ ConnectedJoyCon WaitForJoyCon(const std::wstring& prompt)
     watcher.ScanningMode(BluetoothLEScanningMode::Active);
     watcher.Start();
 
-    std::wcout << L"Scanning for Joy-Con... (Waiting up to 30 seconds)\n";
+    std::wcout << L"Scanning for Joy-Con... Please sync your RIGHT Joy-Con now.\n";
+    std::wcout << L"(Waiting up to 30 seconds)\n";
 
     {
         std::unique_lock<std::mutex> lock(mtx);
@@ -179,328 +141,57 @@ ConnectedJoyCon WaitForJoyCon(const std::wstring& prompt)
     return cj;
 }
 
-enum ControllerType {
-    SingleJoyCon = 1,
-    DualJoyCon = 2,
-    ProController = 3
-};
-
-struct PlayerConfig {
-    ControllerType controllerType;
-    JoyConSide joyconSide;
-    JoyConOrientation joyconOrientation;
-};
-
-// For single Joy-Con players, store controller + JoyCon info to keep alive
-struct SingleJoyConPlayer {
-    ConnectedJoyCon joycon;
-    PVIGEM_TARGET ds4Controller;
-    JoyConSide side;
-    JoyConOrientation orientation;
-};
-
-// For dual Joy-Con players, store both JoyCons, controller, thread, and running flag
-struct DualJoyConPlayer {
-    ConnectedJoyCon leftJoyCon;
-    ConnectedJoyCon rightJoyCon;
-    PVIGEM_TARGET ds4Controller;
-    std::atomic<bool> running;
-    std::thread updateThread;
-};
-
-// For Pro Controller players
-struct ProControllerPlayer {
-    ConnectedJoyCon controller;
-    PVIGEM_TARGET ds4Controller;
-};
-
-// Declare the Pro Controller report generator (implement in JoyConDecoder.cpp)
-DS4_REPORT_EX GenerateProControllerReport(const std::vector<uint8_t>& buffer);
-
 int main()
 {
     init_apartment();
 
-    int numPlayers;
-    std::wcout << L"How many players? ";
-    std::wcin >> numPlayers;
-    std::wcin.ignore();
+    std::wcout << L"Joy-Con Mouse Control\n";
+    std::wcout << L"=====================\n\n";
 
-    std::vector<PlayerConfig> playerConfigs;
+    // Connect to right Joy-Con
+    ConnectedJoyCon rightJoyCon = WaitForJoyCon();
 
-    for (int i = 0; i < numPlayers; ++i) {
-        PlayerConfig config{};
-        std::wstring line;
+    // Set up data callbacks
+    rightJoyCon.inputChar.ValueChanged([](GattCharacteristic const&, GattValueChangedEventArgs const& args)
+        {
+            auto reader = DataReader::FromBuffer(args.CharacteristicValue());
+            std::vector<uint8_t> buffer(reader.UnconsumedBufferLength());
+            reader.ReadBytes(buffer);
 
-        while (true) {
-            std::wcout << L"Player " << (i + 1) << L":\n";
-            std::wcout << L"  What controller type? (1=Single JoyCon, 2=Dual JoyCon, 3=Pro Controller): ";
-            std::getline(std::wcin, line);
-            if (line == L"1" || line == L"2" || line == L"3") {
-                config.controllerType = static_cast<ControllerType>(std::stoi(std::string(line.begin(), line.end())));
-                break;
-            }
-            std::wcout << L"Invalid input. Please enter 1, 2, or 3.\n";
-        }
+            // Control mouse from Joy-Con data
+            ControlMouseFromJoyCon(buffer, JoyConSide::Right, JoyConOrientation::Upright);
+            
+            // Optional: Also display data (comment out if you don't want console output)
+            DisplayJoyConData(buffer, JoyConSide::Right, JoyConOrientation::Upright);
+        });
 
-        if (config.controllerType == SingleJoyCon) {
-            while (true) {
-                std::wcout << L"  Which side? (L=Left, R=Right): ";
-                std::getline(std::wcin, line);
-                if (line == L"L" || line == L"R" || line == L"l" || line == L"r") {
-                    config.joyconSide = (line == L"L" || line == L"l") ? JoyConSide::Left : JoyConSide::Right;
-                    break;
-                }
-                std::wcout << L"Invalid input. Please enter L or R.\n";
-            }
-            while (true) {
-                std::wcout << L"  What orientation? (U=Upright, S=Sideways): ";
-                std::getline(std::wcin, line);
-                if (line == L"U" || line == L"S" || line == L"u" || line == L"s") {
-                    config.joyconOrientation = (line == L"S" || line == L"s") ? JoyConOrientation::Sideways : JoyConOrientation::Upright;
-                    break;
-                }
-                std::wcout << L"Invalid input. Please enter U or S.\n";
-            }
-        }
-        else if (config.controllerType == DualJoyCon) {
-            config.joyconSide = JoyConSide::Left;
-            config.joyconOrientation = JoyConOrientation::Upright;
-        }
+    // Enable notifications
+    auto status = rightJoyCon.inputChar.WriteClientCharacteristicConfigurationDescriptorAsync(
+        GattClientCharacteristicConfigurationDescriptorValue::Notify).get();
 
-        playerConfigs.push_back(config);
+    // Send custom commands to initialize Joy-Con
+    if (rightJoyCon.writeChar)
+        SendCustomCommands(rightJoyCon.writeChar);
+
+    if (status == GattCommunicationStatus::Success)
+    {
+        std::wcout << L"Right Joy-Con connected successfully!\n\n";
+        std::wcout << L"Mouse control is now active:\n";
+        std::wcout << L"- Move Joy-Con to control mouse cursor\n";
+        std::wcout << L"- A button = Left click\n";
+        std::wcout << L"- B button = Right click\n";
+        std::wcout << L"- Data display below (press Enter to exit):\n\n";
+    }
+    else
+    {
+        std::wcout << L"Failed to enable notifications.\n";
+        return 1;
     }
 
-    InitializeViGEm();
-
-    // Store all players to keep them alive
-    std::vector<SingleJoyConPlayer> singlePlayers;
-    std::vector<std::unique_ptr<DualJoyConPlayer>> dualPlayers;
-    std::vector<ProControllerPlayer> proPlayers;
-
-    for (int i = 0; i < numPlayers; ++i) {
-        auto& config = playerConfigs[i];
-        std::wcout << L"Player " << (i + 1) << L" setup...\n";
-
-        if (config.controllerType == SingleJoyCon) {
-            std::wstring sideStr = (config.joyconSide == JoyConSide::Left) ? L"Left" : L"Right";
-            std::wcout << L"Please sync your single Joy-Con (" << sideStr << L") now.\n";
-
-            ConnectedJoyCon cj = WaitForJoyCon(L"Waiting for single Joy-Con...");
-
-            PVIGEM_TARGET ds4_controller = vigem_target_ds4_alloc();
-            auto ret = vigem_target_add(vigem_client, ds4_controller);
-            if (!VIGEM_SUCCESS(ret))
-            {
-                std::wcerr << L"Failed to add DS4 controller target: 0x" << std::hex << ret << L"\n";
-                exit(1);
-            }
-
-            singlePlayers.push_back({ cj, ds4_controller, config.joyconSide, config.joyconOrientation });
-            auto& player = singlePlayers.back();
-
-            player.joycon.inputChar.ValueChanged([joyconSide = player.side, joyconOrientation = player.orientation, &player](GattCharacteristic const&, GattValueChangedEventArgs const& args)
-                {
-                    auto reader = DataReader::FromBuffer(args.CharacteristicValue());
-                    std::vector<uint8_t> buffer(reader.UnconsumedBufferLength());
-                    reader.ReadBytes(buffer);
-
-                    DS4_REPORT_EX report = GenerateDS4Report(buffer, joyconSide, joyconOrientation);
-
-                    auto ret = vigem_target_ds4_update_ex(vigem_client, player.ds4Controller, report);
-                    if (!VIGEM_SUCCESS(ret)) {
-                        std::wcerr << L"Failed to update DS4 EX report: 0x" << std::hex << ret << L"\n";
-                    }
-                });
-
-            auto status = player.joycon.inputChar.WriteClientCharacteristicConfigurationDescriptorAsync(
-                GattClientCharacteristicConfigurationDescriptorValue::Notify).get();
-
-            if (player.joycon.writeChar)
-                SendCustomCommands(player.joycon.writeChar);
-
-            if (status == GattCommunicationStatus::Success)
-                std::wcout << L"Notifications enabled.\n";
-            else
-                std::wcout << L"Failed to enable notifications.\n";
-
-            std::wcout << L"Press Enter to continue...\n";
-            std::wstring dummy;
-            std::getline(std::wcin, dummy);
-        }
-        else if (config.controllerType == DualJoyCon) {
-            std::wcout << L"Please sync your RIGHT Joy-Con now.\n";
-            ConnectedJoyCon rightJoyCon = WaitForJoyCon(L"Waiting for RIGHT Joy-Con...");
-            if (rightJoyCon.writeChar)
-                SendCustomCommands(rightJoyCon.writeChar);
-
-            std::wcout << L"Please sync your LEFT Joy-Con now.\n";
-            ConnectedJoyCon leftJoyCon = WaitForJoyCon(L"Waiting for LEFT Joy-Con...");
-            if (leftJoyCon.writeChar)
-                SendCustomCommands(leftJoyCon.writeChar);
-
-            PVIGEM_TARGET ds4Controller = vigem_target_ds4_alloc();
-            auto ret = vigem_target_add(vigem_client, ds4Controller);
-            if (!VIGEM_SUCCESS(ret))
-            {
-                std::wcerr << L"Failed to add DS4 controller target: 0x" << std::hex << ret << L"\n";
-                exit(1);
-            }
-
-            auto dualPlayer = std::make_unique<DualJoyConPlayer>();
-            dualPlayer->leftJoyCon = leftJoyCon;
-            dualPlayer->rightJoyCon = rightJoyCon;
-            dualPlayer->ds4Controller = ds4Controller;
-            dualPlayer->running.store(true);
-
-            std::atomic<std::shared_ptr<std::vector<uint8_t>>> leftBufferAtomic{ std::make_shared<std::vector<uint8_t>>() };
-            std::atomic<std::shared_ptr<std::vector<uint8_t>>> rightBufferAtomic{ std::make_shared<std::vector<uint8_t>>() };
-
-            dualPlayer->leftJoyCon.inputChar.ValueChanged([&leftBufferAtomic](GattCharacteristic const&, GattValueChangedEventArgs const& args)
-                {
-                    auto reader = DataReader::FromBuffer(args.CharacteristicValue());
-                    auto buf = std::make_shared<std::vector<uint8_t>>(reader.UnconsumedBufferLength());
-                    reader.ReadBytes(*buf);
-                    leftBufferAtomic.store(buf, std::memory_order_release);
-                });
-
-            auto statusLeft = dualPlayer->leftJoyCon.inputChar.WriteClientCharacteristicConfigurationDescriptorAsync(
-                GattClientCharacteristicConfigurationDescriptorValue::Notify).get();
-
-            if (statusLeft == GattCommunicationStatus::Success)
-                std::wcout << L"LEFT Joy-Con notifications enabled.\n";
-            else
-                std::wcout << L"Failed to enable LEFT Joy-Con notifications.\n";
-
-            dualPlayer->rightJoyCon.inputChar.ValueChanged([&rightBufferAtomic](GattCharacteristic const&, GattValueChangedEventArgs const& args)
-                {
-                    auto reader = DataReader::FromBuffer(args.CharacteristicValue());
-                    auto buf = std::make_shared<std::vector<uint8_t>>(reader.UnconsumedBufferLength());
-                    reader.ReadBytes(*buf);
-                    rightBufferAtomic.store(buf, std::memory_order_release);
-                });
-
-            auto statusRight = dualPlayer->rightJoyCon.inputChar.WriteClientCharacteristicConfigurationDescriptorAsync(
-                GattClientCharacteristicConfigurationDescriptorValue::Notify).get();
-
-            if (statusRight == GattCommunicationStatus::Success)
-                std::wcout << L"RIGHT Joy-Con notifications enabled.\n";
-            else
-                std::wcout << L"Failed to enable RIGHT Joy-Con notifications.\n";
-
-            dualPlayer->updateThread = std::thread([dualPlayerPtr = dualPlayer.get(), &leftBufferAtomic, &rightBufferAtomic]()
-                {
-                    while (dualPlayerPtr->running.load(std::memory_order_acquire))
-                    {
-                        auto leftBuf = leftBufferAtomic.load(std::memory_order_acquire);
-                        auto rightBuf = rightBufferAtomic.load(std::memory_order_acquire);
-
-                        if (leftBuf->empty() || rightBuf->empty())
-                        {
-                            std::this_thread::sleep_for(std::chrono::milliseconds(5));
-                            continue;
-                        }
-
-                        DS4_REPORT_EX report = GenerateDualJoyConDS4Report(*leftBuf, *rightBuf);
-
-                        auto ret = vigem_target_ds4_update_ex(vigem_client, dualPlayerPtr->ds4Controller, report);
-                        if (!VIGEM_SUCCESS(ret))
-                        {
-                            std::wcerr << L"Failed to update DS4 report: 0x" << std::hex << ret << L"\n";
-                        }
-
-                        std::this_thread::sleep_for(std::chrono::milliseconds(16)); // ~60Hz
-                    }
-                });
-
-            dualPlayers.push_back(std::move(dualPlayer));
-
-            std::wcout << L"Dual Joy-Cons connected and configured. Press Enter to continue...\n";
-            std::wstring dummy;
-            std::getline(std::wcin, dummy);
-        }
-        else if (config.controllerType == ProController) {
-            std::wcout << L"Please sync your Pro Controller now.\n";
-
-            ConnectedJoyCon proController = WaitForJoyCon(L"Waiting for Pro Controller...");
-
-            PVIGEM_TARGET ds4_controller = vigem_target_ds4_alloc();
-            auto ret = vigem_target_add(vigem_client, ds4_controller);
-            if (!VIGEM_SUCCESS(ret))
-            {
-                std::wcerr << L"Failed to add DS4 controller target: 0x" << std::hex << ret << L"\n";
-                exit(1);
-            }
-
-            proController.inputChar.ValueChanged([ds4_controller](GattCharacteristic const&, GattValueChangedEventArgs const& args) mutable
-                {
-                    auto reader = DataReader::FromBuffer(args.CharacteristicValue());
-                    std::vector<uint8_t> buffer(reader.UnconsumedBufferLength());
-                    reader.ReadBytes(buffer);
-
-
-                    DS4_REPORT_EX report = GenerateProControllerReport(buffer);
-
-                    auto ret = vigem_target_ds4_update_ex(vigem_client, ds4_controller, report);
-                    if (!VIGEM_SUCCESS(ret)) {
-                        std::wcerr << L"Failed to update DS4 EX report: 0x" << std::hex << ret << L"\n";
-                    }
-                });
-
-            auto status = proController.inputChar.WriteClientCharacteristicConfigurationDescriptorAsync(
-                GattClientCharacteristicConfigurationDescriptorValue::Notify).get();
-
-            if (proController.writeChar)
-                SendCustomCommands(proController.writeChar);
-
-            if (status == GattCommunicationStatus::Success)
-                std::wcout << L"Pro Controller notifications enabled.\n";
-            else
-                std::wcout << L"Failed to enable Pro Controller notifications.\n";
-
-            std::wcout << L"Press Enter to continue...\n";
-            std::wstring dummy;
-            std::getline(std::wcin, dummy);
-
-            proPlayers.push_back({ proController, ds4_controller });
-        }
-    }
-
-    std::wcout << L"All players connected. Press Enter to exit...\n";
+    // Wait for user input to exit
     std::wstring dummy;
     std::getline(std::wcin, dummy);
 
-    // Clean up dual player threads & free controllers
-    for (auto& dp : dualPlayers)
-    {
-        dp->running.store(false);
-        if (dp->updateThread.joinable())
-            dp->updateThread.join();
-
-        vigem_target_remove(vigem_client, dp->ds4Controller);
-        vigem_target_free(dp->ds4Controller);
-    }
-
-    // Free single players controllers
-    for (auto& sp : singlePlayers)
-    {
-        vigem_target_remove(vigem_client, sp.ds4Controller);
-        vigem_target_free(sp.ds4Controller);
-    }
-
-    // Free Pro Controllers
-    for (auto& pp : proPlayers)
-    {
-        vigem_target_remove(vigem_client, pp.ds4Controller);
-        vigem_target_free(pp.ds4Controller);
-    }
-
-    if (vigem_client)
-    {
-        vigem_disconnect(vigem_client);
-        vigem_free(vigem_client);
-        vigem_client = nullptr;
-    }
-
+    std::wcout << L"\nExiting...\n";
     return 0;
 }
